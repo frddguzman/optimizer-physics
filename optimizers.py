@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-# Warm up torch.optim + autograd on first import — eliminates multi-second delay on first callback
+# Warm up torch.optim + autograd — elimina el delay multi-segundo en el primer callback
 def _warmup():
     w = torch.tensor([0.0, 0.0], requires_grad=True)
     for Opt in (torch.optim.SGD, torch.optim.Adam):
@@ -14,36 +14,76 @@ def _warmup():
 
 _warmup()
 
+# ── Namespace seguro para eval con torch ──────────────────────────────────
+_TORCH_NS = {k: getattr(torch, k) for k in dir(torch) if not k.startswith('_')}
+_TORCH_NS['torch'] = torch
 
-# Beale function (torch) — global min at (3, 0.5), J = 0
+
+class _TorchNP:
+    """Proxy np.* → torch para mantener el grafo de autograd en expresiones custom."""
+    cos   = staticmethod(torch.cos)
+    sin   = staticmethod(torch.sin)
+    tan   = staticmethod(torch.tan)
+    exp   = staticmethod(torch.exp)
+    log   = staticmethod(torch.log)
+    log2  = staticmethod(torch.log2)
+    log10 = staticmethod(torch.log10)
+    sqrt  = staticmethod(torch.sqrt)
+    abs   = staticmethod(torch.abs)
+    tanh  = staticmethod(torch.tanh)
+    cosh  = staticmethod(torch.cosh)
+    sinh  = staticmethod(torch.sinh)
+    pi    = 3.141592653589793
+    e     = 2.718281828459045
+
+_TORCH_NP = _TorchNP()
+
+
+def _eval_torch(expr: str, w):
+    """Evalúa expr(x, y) con tensores torch para autograd.
+    np.cos/sin/exp/… se redirigen a torch para mantener el grafo."""
+    x, y = w[0], w[1]
+    ns = {**_TORCH_NS, 'x': x, 'y': y, 'np': _TORCH_NP}
+    return eval(compile(expr, '<fn>', 'eval'), {"__builtins__": {}}, ns)  # noqa: S307
+
+
+# ── Funciones de compatibilidad (la superficie se sigue llamando beale_numpy) ──
+
 def beale(w):
+    """Beale function (torch) — global min at (3, 0.5), J = 0."""
     x, y = w[0], w[1]
     return ((1.5 - x + x * y) ** 2 +
             (2.25 - x + x * y ** 2) ** 2 +
             (2.625 - x + x * y ** 3) ** 2)
 
 
-# Beale function (numpy) — for surface mesh rendering
 def beale_numpy(X, Y):
+    """Beale function (numpy) — mantenida por compatibilidad."""
     return ((1.5 - X + X * Y) ** 2 +
             (2.25 - X + X * Y ** 2) ** 2 +
             (2.625 - X + X * Y ** 3) ** 2)
 
 
-def run(opt_type, lr, mu, beta1, beta2, n=200):
-    """Run optimizer on Beale's function from fixed start (-4.5, -4.5).
+def run(opt_type: str, lr: float, mu: float, beta1: float, beta2: float,
+        n: int = 200, fn_expr: str | None = None):
+    """Ejecuta el optimizador sobre fn_expr (o Beale si fn_expr es None).
 
-    Returns (xs, ys, js) — trajectory coordinates with log1p-compressed loss.
+    Devuelve (xs, ys, js) — trayectoria con pérdida log1p-comprimida.
     """
     w = torch.tensor([-4.5, -4.5], dtype=torch.float32, requires_grad=True)
 
-    # Build optimizer — gate params by type to avoid invalid combinations
+    # Selecciona la función de pérdida
+    if fn_expr:
+        def loss_fn(w_): return _eval_torch(fn_expr, w_)
+    else:
+        def loss_fn(w_): return beale(w_)
+
+    # Construye el optimizador
     if opt_type == 'sgd':
         opt = torch.optim.SGD([w], lr=lr)
     elif opt_type == 'momentum':
         opt = torch.optim.SGD([w], lr=lr, momentum=mu)
     elif opt_type == 'nesterov':
-        # Nesterov requires momentum > 0
         opt = torch.optim.SGD([w], lr=lr, momentum=max(mu, 0.01), nesterov=True)
     elif opt_type == 'adam':
         opt = torch.optim.Adam([w], lr=lr, betas=(beta1, beta2))
@@ -53,20 +93,19 @@ def run(opt_type, lr, mu, beta1, beta2, n=200):
     xs = np.empty(n)
     ys = np.empty(n)
     js = np.empty(n)
+
     for i in range(n):
         opt.zero_grad()
-        loss = beale(w)
+        loss = loss_fn(w)
         loss.backward()
-        # Clip gradients — Beale has ~250k gradient norm at (-4.5,-4.5),
-        # which makes SGD/Momentum explode to boundary without clipping
+        # Clipping — evita explosión de gradiente en funciones con alta curvatura
         torch.nn.utils.clip_grad_norm_([w], max_norm=10.0)
         opt.step()
         with torch.no_grad():
-            w.clamp_(-5, 5)  # prevent domain escape → NaN
+            w.clamp_(-5, 5)        # evita NaN por escape de dominio
         xs[i] = w[0].item()
         ys[i] = w[1].item()
-        # Recompute loss at NEW position so (x, y, z) lies on the surface
         with torch.no_grad():
-            js[i] = np.log1p(beale(w).item())
+            js[i] = np.log1p(abs(loss_fn(w).item()))
 
     return xs.tolist(), ys.tolist(), js.tolist()
