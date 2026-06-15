@@ -2,7 +2,7 @@
 
 Interactive 3D visualization of how gradient-based optimizers navigate a non-convex loss landscape.
 
-Built for the **Modelos Conexionistas** contest (Ciencia de Datos, UV).
+
 
 ## What it does
 
